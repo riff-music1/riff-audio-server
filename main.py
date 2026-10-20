@@ -2,7 +2,8 @@ import os
 import re
 import urllib.parse
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -16,10 +17,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def clean_title(title: str) -> str:
+def clean_song_query(title: str) -> str:
+    # Brackets aur extra text remove karein
     t = re.sub(r'\(.*?\)|\[.*?\]', '', title)
-    t = re.sub(r'(?i)(official video|music video|full video|lyrics|audio|hd|4k|coke studio|season \d+|complete edition|mega mashup|visualizer)', '', t)
-    return t.strip()
+    t = re.sub(r'(?i)(official video|music video|full video|lyrics|audio|hd|4k|coke studio|season \d+|complete edition|mega mashup|visualizer|feat\.|ft\.|featuring)', '', t)
+    t = re.sub(r'[-_~|/\\&]', ' ', t)
+    return ' '.join(t.split())
 
 def get_youtube_title(video_id: str) -> str:
     try:
@@ -53,90 +56,93 @@ def get_saavn_stream(query: str):
                                 "title": results[0].get('name') or query,
                                 "url": url,
                                 "duration": int(results[0].get('duration', 240)),
-                                "source": "jiosaavn-320kbps"
+                                "source": "jiosaavn-320kbps-full"
                             }
         except Exception:
             continue
     return None
 
-def get_proxy_stream(video_id: str):
-    piped_instances = [
+def get_direct_piped_url(video_id: str) -> str:
+    mirrors = [
         f"https://api.piped.private.coffee/streams/{video_id}",
         f"https://pipedapi.kavin.rocks/streams/{video_id}",
         f"https://pipedapi.tokhmi.xyz/streams/{video_id}"
     ]
-    for inst in piped_instances:
+    for m in mirrors:
         try:
-            r = requests.get(inst, timeout=4)
+            r = requests.get(m, timeout=4)
             if r.status_code == 200:
                 data = r.json()
                 streams = data.get("audioStreams", [])
                 if streams:
                     best = sorted(streams, key=lambda x: x.get('bitrate', 0), reverse=True)[0]
-                    return {
-                        "title": data.get("title", ""),
-                        "url": best.get("url"),
-                        "duration": data.get("duration", 240),
-                        "source": "piped-stream"
-                    }
+                    return best.get("url", "")
         except Exception:
             continue
-
-    invidious_instances = [
-        f"https://invidious.nerdvpn.de/api/v1/videos/{video_id}?local=true",
-        f"https://inv.nadeko.net/api/v1/videos/{video_id}?local=true"
-    ]
-    for inst in invidious_instances:
-        try:
-            r = requests.get(inst, timeout=4)
-            if r.status_code == 200:
-                data = r.json()
-                formats = [f for f in data.get("adaptiveFormats", []) if f.get("type", "").startswith("audio")]
-                if formats:
-                    return {
-                        "title": data.get("title", ""),
-                        "url": formats[0].get("url"),
-                        "duration": data.get("lengthSeconds", 240),
-                        "source": "invidious-stream"
-                    }
-        except Exception:
-            continue
-    return None
+    return ""
 
 @app.get("/")
-def root():
+def home():
     return {"status": "RIFF Audio Engine Online"}
 
+# Server-side Relay: YouTube audio bytes ko bina IP lock ke client ko stream karta hai
+@app.get("/audio")
+def stream_audio_relay(id: str, request: Request):
+    stream_url = get_direct_piped_url(id)
+    if not stream_url:
+        raise HTTPException(status_code=404, detail="Audio source not available")
+
+    req_headers = {'User-Agent': 'Mozilla/5.0'}
+    if 'range' in request.headers:
+        req_headers['Range'] = request.headers['range']
+
+    try:
+        r = requests.get(stream_url, headers=req_headers, stream=True, timeout=10)
+        res_headers = {
+            'Accept-Ranges': 'bytes',
+            'Content-Type': r.headers.get('content-type', 'audio/mp4'),
+        }
+        if 'content-range' in r.headers:
+            res_headers['Content-Range'] = r.headers['content-range']
+        if 'content-length' in r.headers:
+            res_headers['Content-Length'] = r.headers['content-length']
+
+        return StreamingResponse(
+            r.iter_content(chunk_size=65536),
+            status_code=r.status_code,
+            headers=res_headers
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/stream")
-def stream_audio(id: str):
+def get_stream(id: str, request: Request):
     if not id:
         raise HTTPException(status_code=400, detail="Video ID is required")
 
-    # 1. Clean title se JioSaavn 320kbps full song check (Fastest, zero bot block)
-    raw_title = get_youtube_title(id)
-    if raw_title:
-        cleaned = clean_title(raw_title)
-        res = get_saavn_stream(cleaned)
-        if res:
-            return res
+    # 1. First Tier: JioSaavn 320kbps Full Song (Fastest, unblocked, direct full length)
+    yt_title = get_youtube_title(id)
+    if yt_title:
+        cleaned = clean_song_query(yt_title)
+        saavn_res = get_saavn_stream(cleaned)
+        if saavn_res:
+            return saavn_res
+        
+        # Agar query lambi thi to first 3 words se search karein
+        parts = cleaned.split()
+        if len(parts) > 2:
+            short_res = get_saavn_stream(" ".join(parts[:3]))
+            if short_res:
+                return short_res
 
-    # 2. Piped / Invidious unblocked audio streams
-    stream = get_proxy_stream(id)
-    if stream:
-        return stream
-
-    # 3. Raw title fallback
-    if raw_title:
-        res = get_saavn_stream(raw_title)
-        if res:
-            return res
-
-    # 4. Zero-failure fallback taake app kabhi crash na ho
+    # 2. Second Tier: Railway Audio Relay (Google IP block ko bypass karke direct stream karega)
+    host = request.headers.get("host", "riff-audio-server-production.up.railway.app")
+    relay_url = f"https://{host}/audio?id={id}"
     return {
-        "title": raw_title or "RIFF Music Stream",
-        "url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
-        "duration": 372,
-        "source": "backup-stream"
+        "title": yt_title or "RIFF Audio Track",
+        "url": relay_url,
+        "duration": 240,
+        "source": "railway-relay-full"
     }
 
 if __name__ == "__main__":
