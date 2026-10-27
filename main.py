@@ -2,7 +2,8 @@ import os
 import re
 import urllib.parse
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -16,86 +17,161 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-YT_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyBknC1FYhzF75wKSRJJYX3-eWvfcRCPi5U")
-
-def clean_song_query(title: str) -> str:
-    t = re.sub(r'\(.*?\)|\[.*?\]', '', title)
-    t = re.sub(r'(?i)(official video|music video|full video|lyrics|audio|hd|4k|coke studio|season \d+|complete edition|mega mashup|visualizer|feat\.|ft\.|featuring)', '', t)
-    t = re.sub(r'[-_~|/\\&]', ' ', t)
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    # Brackets aur unke andar ka text remove karein
+    t = re.sub(r'\(.*?\)|\[.*?\]', ' ', text)
+    # Extra keywords remove karein
+    t = re.sub(r'(?i)(official video|music video|full video|full song|lyrics|lyrical|audio|hd|4k|coke studio|season \d+|complete edition|mega mashup|visualizer|feat\.|ft\.|featuring)', ' ', t)
+    # Special characters ko space banayein
+    t = re.sub(r'[-_~|/\\&:]', ' ', t)
     return ' '.join(t.split())
 
-def get_title_from_youtube_api(video_id: str) -> str:
-    try:
-        url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet&id={video_id}&key={YT_API_KEY}"
-        res = requests.get(url, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            items = data.get("items", [])
-            if items:
-                return items[0]["snippet"].get("title", "")
-    except Exception:
-        pass
-    return ""
-
-def search_saavn_direct(query: str):
-    if not query:
+def query_saavn_direct(query: str):
+    if not query or len(query.strip()) < 2:
         return None
+    
+    encoded = urllib.parse.quote(query.strip())
     endpoints = [
-        f"https://saavn.dev/api/search/songs?query={urllib.parse.quote(query)}",
-        f"https://saavn.me/search/songs?query={urllib.parse.quote(query)}",
-        f"https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query={urllib.parse.quote(query)}"
+        f"https://saavn.dev/api/search/songs?query={encoded}",
+        f"https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query={encoded}",
+        f"https://saavn.sumit.co/api/search/songs?query={encoded}"
     ]
+    
     for ep in endpoints:
         try:
-            res = requests.get(ep, timeout=4)
-            if res.status_code == 200:
-                data = res.json()
+            r = requests.get(ep, timeout=4)
+            if r.status_code == 200:
+                data = r.json()
                 results = data.get('data', {}).get('results', []) or data.get('results', [])
-                if results:
+                if isinstance(results, list) and len(results) > 0:
                     first = results[0]
-                    download_urls = first.get('downloadUrl', [])
-                    if download_urls:
-                        best_url = download_urls[-1].get('url') or download_urls[-1].get('link')
-                        if best_url:
+                    downloads = first.get('downloadUrl', [])
+                    if isinstance(downloads, list) and downloads:
+                        # Highest quality CDN URL uthayein (320kbps)
+                        best = downloads[-1].get('url') or downloads[-1].get('link')
+                        if best:
                             return {
                                 "title": first.get('name') or query,
-                                "url": best_url,
+                                "artist": first.get('artists', {}).get('primary', [{}])[0].get('name', ''),
                                 "duration": int(first.get('duration', 240)),
-                                "source": "saavn-320kbps-full"
+                                "url": best,
+                                "quality": "320kbps-cdn",
+                                "source": "saavn-direct"
                             }
         except Exception:
             continue
     return None
 
+def fetch_youtube_title(video_id: str) -> str:
+    try:
+        url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        res = requests.get(url, timeout=4)
+        if res.status_code == 200:
+            return res.json().get('title', '')
+    except Exception:
+        pass
+    return ""
+
+def get_piped_stream_url(video_id: str) -> str:
+    mirrors = [
+        f"https://api.piped.private.coffee/streams/{video_id}",
+        f"https://pipedapi.kavin.rocks/streams/{video_id}"
+    ]
+    for m in mirrors:
+        try:
+            r = requests.get(m, timeout=4)
+            if r.status_code == 200:
+                data = r.json()
+                streams = data.get("audioStreams", [])
+                if streams:
+                    best = sorted(streams, key=lambda x: x.get('bitrate', 0), reverse=True)[0]
+                    return best.get("url", "")
+        except Exception:
+            continue
+    return ""
+
 @app.get("/")
 def home():
-    return {"status": "RIFF Audio Engine Online"}
+    return {"status": "RIFF Smart Audio Server 100% Online"}
+
+# Server-side Relay: 403 Google IP block bypass karne ke liye
+@app.get("/audio_stream")
+def audio_stream(id: str, request: Request):
+    if not id:
+        raise HTTPException(status_code=400, detail="ID required")
+    
+    stream_url = get_piped_stream_url(id)
+    if not stream_url:
+        raise HTTPException(status_code=404, detail="Stream unavailable")
+
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    if 'range' in request.headers:
+        headers['Range'] = request.headers['range']
+
+    try:
+        r = requests.get(stream_url, headers=headers, stream=True, timeout=8)
+        res_headers = {'Accept-Ranges': 'bytes', 'Content-Type': r.headers.get('content-type', 'audio/mp4')}
+        if 'content-range' in r.headers:
+            res_headers['Content-Range'] = r.headers['content-range']
+        if 'content-length' in r.headers:
+            res_headers['Content-Length'] = r.headers['content-length']
+        return StreamingResponse(r.iter_content(chunk_size=65536), status_code=r.status_code, headers=res_headers)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/stream")
-def get_stream(id: str = None, query: str = None):
-    target = query
-    if id and not target:
-        yt_title = get_title_from_youtube_api(id)
-        if yt_title:
-            target = clean_song_query(yt_title)
+def get_stream(query: str = None, id: str = None, request: Request = None):
+    # Target search string prepare karein
+    raw_text = query or ""
+    
+    # 1. Agar video ID hai aur query nahi to YouTube title lein
+    if id and not raw_text:
+        raw_text = fetch_youtube_title(id)
+    
+    cleaned = clean_text(raw_text)
+    
+    # Duplicate words hatayein (maslan "295 Sidhu Sidhu" -> "295 Sidhu")
+    words = cleaned.split()
+    seen = set()
+    deduped = []
+    for w in words:
+        wl = w.lower()
+        if wl not in seen:
+            seen.add(wl)
+            deduped.append(w)
+    smart_query = " ".join(deduped)
 
-    if target:
-        res = search_saavn_direct(target)
+    # 2. Multi-tier Saavn Lookup
+    # Tier A: Full smart query
+    if smart_query:
+        res = query_saavn_direct(smart_query)
         if res:
             return res
-        
-        words = target.split()
-        if len(words) > 2:
-            res_short = search_saavn_direct(" ".join(words[:3]))
-            if res_short:
-                return res_short
 
-    # High quality CDN fallback
+    # Tier B: Sirf pehle 2 ya 3 words (e.g. "Pasoori", "Kahani Suno", "295")
+    if len(words) > 1:
+        res = query_saavn_direct(" ".join(words[:2]))
+        if res:
+            return res
+
+    # 3. Agar Saavn par na mile aur YouTube ID ho, to Server Relay Stream de dein (Zero 403 block)
+    if id:
+        host = request.headers.get("host", "riff-audio-server-production.up.railway.app")
+        return {
+            "title": raw_text or "RIFF Track",
+            "url": f"https://{host}/audio_stream?id={id}",
+            "duration": 240,
+            "source": "server-relay-unblocked"
+        }
+
+    # 4. Fallback safe stream
     return {
-        "title": target or "RIFF Full Stream",
+        "title": "RIFF Stream",
         "url": "https://aac.saavn.cdn.jiosaavn.com/264/34b6b668d2a6a6fa58dfc9a59b9a544d_320.mp4",
         "duration": 240,
-        "source": "saavn-cdn-stream"
+        "source": "cdn-fallback"
     }
 
 if __name__ == "__main__":
