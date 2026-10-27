@@ -2,7 +2,7 @@ import os
 import re
 import urllib.parse
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -60,7 +60,7 @@ def query_saavn_direct(query: str):
     return None
 
 def fetch_youtube_title(video_id: str) -> str:
-    if not video_id or len(video_id) != 11 or not re.match(r'^[A-Za-z0-9_-]{11}$', video_id):
+    if not video_id or len(video_id) != 11:
         return ""
     try:
         url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
@@ -73,39 +73,35 @@ def fetch_youtube_title(video_id: str) -> str:
 
 @app.get("/")
 def home():
-    return {"status": "RIFF Audio Server 100% Online"}
+    return {"status": "RIFF Audio Server Online"}
 
 @app.get("/stream")
 def get_stream(query: str = "", id: str = ""):
-    target_query = query.strip()
+    target = query.strip()
     
-    # Agar query nahi hai lekin valid 11-char YouTube ID hai to title fetch karein
-    if not target_query and id and len(id) == 11:
+    if not target and id and len(id) == 11:
         yt_title = fetch_youtube_title(id)
         if yt_title:
-            target_query = yt_title
+            target = yt_title
 
-    cleaned = clean_text(target_query)
+    cleaned = clean_text(target)
     
-    # Saavn direct 320kbps stream search
     if cleaned:
         res = query_saavn_direct(cleaned)
         if res:
             return res
 
-        # Short query fallback (first 2 words)
         words = cleaned.split()
         if len(words) > 1:
             res_short = query_saavn_direct(" ".join(words[:2]))
             if res_short:
                 return res_short
 
-    # High quality fallback stream
     return {
-        "title": target_query or "RIFF Full Stream",
+        "title": target or "RIFF Track",
         "url": "https://aac.saavn.cdn.jiosaavn.com/264/34b6b668d2a6a6fa58dfc9a59b9a544d_320.mp4",
         "duration": 240,
-        "source": "saavn-cdn"
+        "source": "cdn-fallback"
     }
 
 if __name__ == "__main__":
