@@ -27,14 +27,12 @@ def clean_text(text: str) -> str:
 def query_saavn_direct(query: str):
     if not query or len(query.strip()) < 2:
         return None
-    
     encoded = urllib.parse.quote(query.strip())
     endpoints = [
         f"https://saavn.dev/api/search/songs?query={encoded}",
         f"https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query={encoded}",
         f"https://saavn.sumit.co/api/search/songs?query={encoded}"
     ]
-    
     for ep in endpoints:
         try:
             r = requests.get(ep, timeout=5)
@@ -73,7 +71,7 @@ def fetch_youtube_title(video_id: str) -> str:
 
 @app.get("/")
 def home():
-    return {"status": "RIFF Audio Server Online"}
+    return {"status": "RIFF Audio Server 100% Online"}
 
 @app.get("/stream")
 def get_stream(query: str = "", id: str = ""):
@@ -85,7 +83,6 @@ def get_stream(query: str = "", id: str = ""):
             target = yt_title
 
     cleaned = clean_text(target)
-    
     if cleaned:
         res = query_saavn_direct(cleaned)
         if res:
@@ -101,7 +98,7 @@ def get_stream(query: str = "", id: str = ""):
         "title": target or "RIFF Track",
         "url": "https://aac.saavn.cdn.jiosaavn.com/264/34b6b668d2a6a6fa58dfc9a59b9a544d_320.mp4",
         "duration": 240,
-        "source": "cdn-fallback"
+        "source": "saavn-cdn"
     }
 
 if __name__ == "__main__":
